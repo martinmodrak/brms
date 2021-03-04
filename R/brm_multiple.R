@@ -29,6 +29,31 @@
 #'   result is re-used and all arguments modifying the model code or data are
 #'   ignored. It is not recommended to use this argument directly, but to call
 #'   the \code{\link[brms:update.brmsfit_multiple]{update}} method, instead.
+#' @param file Either \code{NULL} or a character string. In the latter case, the
+#'   fitted model(s) object is saved via \code{\link{saveRDS}} in a file named
+#'   after the string supplied in \code{file}. The \code{.rds} extension is
+#'   added automatically. If the file already exists, \code{brm} will load and
+#'   return the saved model object instead of refitting the model. 
+#'   Unless you specify the \code{file_refit} argument as well, the existing
+#'   files won't be overwritten, you have to manually remove the file in order
+#'   to refit and save the model under an existing file name. The file name
+#'   is stored in the \code{brmsfit} object for later usage.
+#' @param file_refit Modifies when the fits stored via the \code{file} parameter
+#'   is re-used. For \code{"never"} (default) the fit is always loaded if it
+#'   exists and fitting is skipped.  The fits for individual datasets will be
+#'   refit if the model, data or algorithm as passed to Stan differ from
+#'   what is stored in the file. This also covers changes in priors,
+#'   \code{sample_prior}, \code{stanvars}, covariance structure, etc. If you
+#'   believe there was a false positive, you can use
+#'   \code{\link{brmsfit_needs_refit}} to see why refit is deemed necessary.
+#'   The decision is done for each fit, so if you e.g. add more imputed 
+#'   datasets, only the new (or modified) datasets will be refit.
+#'   Refit will not be triggered for changes in additional parameters of the fit
+#'   (e.g., initial values, number of iterations, control arguments, ...). A
+#'   known limitation is that a refit will be triggered if within-chain
+#'   parallelization is switched on/off.
+#'   If set to \code{"on_change"}, 
+#'   \code{combine} needs to be \code{FALSE}.
 #' @param ... Further arguments passed to \code{\link{brm}}.
 #' 
 #' @details The combined model may issue false positive convergence warnings, as
@@ -74,17 +99,27 @@ brm_multiple <- function(formula, data, family = gaussian(), prior = NULL,
                          sparse = NULL, knots = NULL, stanvars = NULL,
                          stan_funs = NULL, recompile = FALSE,
                          combine = TRUE, fit = NA,
-                         seed = NA, file = NULL, ...) {
+                         seed = NA, file = NULL, file_refit = "never",
+                         silent = TRUE,  ...) {
   
   combine <- as_one_logical(combine)
+  file_refit <- match.arg(file_refit, c("never", "on_change"))
+  fits_from_file <- NULL
   if (!is.null(file)) {
-    # optionally load saved model object
-    if (!combine) {
-      stop2("Cannot use 'file' if 'combine' is FALSE.")
-    }
-    fits <- read_brmsfit(file)
-    if (!is.null(fits)) {
-      return(fits)
+    if(combine) {
+      # optionally load saved model object
+      if (file_refit == "on_change") {
+        stop2("Cannot use 'file_refit = \"on_change\"' with `combine = TRUE` yet.")
+      }
+      fits <- read_brmsfit(file)
+      if (!is.null(fits)) {
+        return(fits)
+      }
+    } else {
+      fits_from_file <- read_brmsfit_list(file)
+      if(file_refit == "never" && !is.null(fits_from_file)) {
+        return(fits_from_file)
+      }
     }
   }
   
@@ -104,39 +139,94 @@ brm_multiple <- function(formula, data, family = gaussian(), prior = NULL,
       stop2("'data2' must have the same length as 'data'.")
     }
   }
+
+  brm_args <- nlist(
+    formula, data = data[[1]], family, prior, data2 = data2[[1]], 
+    autocor, cov_ranef, sample_prior, sparse, knots, stanvars, 
+    stan_funs, seed, silent, ...
+  )
   
+  # Extracted into a function to lazily compile only once actually needed
+  compile_model_when_needed <- function() {
+    brm_args$chains <- 0
+    message("Compiling the C++ model")
+    suppressMessages(do_call(brm, brm_args))
+  }  
+    
   if (is.brmsfit(fit)) {
     # avoid complications when updating the model
     class(fit) <- setdiff(class(fit), "brmsfit_multiple")
-  } else {
-    args <- nlist(
-      formula, data = data[[1]], family, prior, data2 = data2[[1]], 
-      autocor, cov_ranef, sample_prior, sparse, knots, stanvars, 
-      stan_funs, seed, ...
-    )
-    args$chains <- 0
-    message("Compiling the C++ model")
-    fit <- suppressMessages(do_call(brm, args))
-  }
-  
+  } 
   dots <- list(...)
   # allow compiling the model without sampling (#671)
   if (isTRUE(dots$chains == 0) || isTRUE(dots$iter == 0)) {
+    if(!is.brmsfit(fit)) {
+      fit <- compile_model_when_needed()
+    }
     class(fit) <- c("brmsfit_multiple", class(fit))
     return(fit)
   }
   
+  brm_args_for_empty_fit <- brm_args
+  brm_args_for_empty_fit$empty <- TRUE
+  any_needed_refit <- FALSE
+  if(!is.null(fits_from_file)) {
+    if(is.null(recompile) || !recompile) {
+      # If recompilation is off, I need to generate the Stan code for 
+      # checking cache only once, using the first dataset
+      # otherwise some aspects of the code might change - notably the
+      # default priors for intercept.
+      empty_fit <- suppressMessages(do.call(brm, brm_args_for_empty_fit))
+      shared_code <- empty_fit$model
+    }
+  } 
+  
   fits <- futures <- rhats <- vector("list", length(data))
+  
   for (i in seq_along(data)) {
-    futures[[i]] <- future::future(
-      update(fit, newdata = data[[i]], data2 = data2[[i]],
-             recompile = recompile, ...),
-      packages = "brms", seed = TRUE
-    )
+    needs_refit <- TRUE
+    if(!is.null(fits_from_file) && !is.null(fits_from_file[[i]])) {
+      
+      # Build an empty fit to reconstruct standata (and potentially code)
+      brm_args_for_empty_fit$data <- data[[i]]
+      brm_args_for_empty_fit$data2 <- data2[[i]]
+      empty_fit <- suppressMessages(do.call(brm, brm_args_for_empty_fit))
+      
+      if(is.null(recompile) || !recompile) {
+        code_for_cache <- shared_code
+      } else {
+        code_for_cache <- empty_fit$model
+      }
+      
+      needs_refit <- brmsfit_needs_refit(fits_from_file[[i]],
+                                         sdata = standata(empty_fit),
+                                         scode = code_for_cache,
+                                         algorithm = empty_fit$algorithm,
+                                         silent = silent,
+                                         verbose = TRUE)
+    }
+      
+    if(needs_refit) {
+      any_needed_refit <- TRUE
+      if(!is.brmsfit(fit)) {
+        fit <- compile_model_when_needed()
+      }
+      futures[[i]] <- future::future(
+        update(fit, newdata = data[[i]], data2 = data2[[i]],
+               recompile = recompile, silent = silent, ...),
+        packages = "brms", seed = TRUE
+      )
+    } else {
+      futures[[i]] <- NA
+      fits[[i]] <- fits_from_file[[i]]
+    }
   }
   for (i in seq_along(data)) {
-    message("Fitting imputed model ", i)
-    fits[[i]] <- future::value(futures[[i]]) 
+    if(!is.logical(futures[[i]])) {
+      message("Fitting imputed model ", i)
+      fits[[i]] <- future::value(futures[[i]]) 
+    }
+    
     rhats[[i]] <- data.frame(as.list(rhat(fits[[i]])))
     if (any(rhats[[i]] > 1.1, na.rm = TRUE)) {
       warning2("Imputed model ", i, " did not converge.")
@@ -147,9 +237,14 @@ brm_multiple <- function(formula, data, family = gaussian(), prior = NULL,
     attr(fits$data, "data_name") <- data_name
     fits$rhats <- do_call(rbind, rhats)
     class(fits) <- c("brmsfit_multiple", class(fits))
-  }
-  if (!is.null(file)) {
-    write_brmsfit(fits, file)
+    if (!is.null(file)) {
+      write_brmsfit(fits, file)
+    }
+  } else {
+    # Write the fit only when we actually did refit at least some models
+    if (!is.null(file) && any_needed_refit) {
+      write_brmsfit_list(fits, file)
+    }
   }
   fits
 }

@@ -779,6 +779,42 @@ read_brmsfit <- function(file) {
   x
 }
 
+# read a list of brmsfit objects (created by brm_multiple) from a file
+# @param file path to an rds file
+# @return a list of brmsfit objects or NULL
+read_brmsfit_list <- function(file) {
+  file <- check_brmsfit_file(file)
+  dir <- dirname(file)
+  if (!dir.exists(dir)) {
+    stop2(
+      "The directory '", dir, "' does not exist. Please choose an ",
+      "existing directory where the model can be saved after fitting."
+    )
+  }
+  x <- suppressWarnings(try(readRDS(file), silent = TRUE))
+  if (!is(x, "try-error")) {
+    if(is.brmsfit(x)) {
+      stop2("Object loaded via 'file' is a brmsfit, but a list of brmsift ", 
+            "objects was expected. Possibly you are trying to read file ",
+            "created by brm(...) or brm_multiple(..., combine = TRUE) ",
+            "in a call to brm_multiple(..., combine = FALSE)")
+    }
+    if (!is.list(x) || length(x) == 0) {
+      stop2("Object loaded via 'file' is not a list of brmsfits.")
+    }
+    for (i in seq_along(x)) {
+      if(!is.brmsfit(x[[i]])) {
+        stop2(paste0("Element '", i, "' of object loaded via 'file' 
+                     is not a brmsfit."))
+      }
+      x[[i]]$file <- file
+    }
+  } else {
+    x <- NULL
+  }
+  x
+}
+
 # write a brmsfit object to a file
 # @param x a brmsfit object
 # @param file path to an rds file
@@ -787,6 +823,22 @@ write_brmsfit <- function(x, file) {
   stopifnot(is.brmsfit(x))
   file <- check_brmsfit_file(file)
   x$file <- file
+  saveRDS(x, file = file)
+  invisible(NULL)
+}
+
+# write a list of brmsfit objects (created by brm_multiple) object to a file
+# @param x a list of brmsfit object
+# @param file path to an rds file
+# @return NULL
+write_brmsfit_list <- function(x, file) {
+  for (i in seq_along(x)) {
+    stopifnot(is.brmsfit(x[[i]]))
+  }
+  file <- check_brmsfit_file(file)
+  for (i in seq_along(x)) {
+    x[[i]]$file <- file
+  }
   saveRDS(x, file = file)
   invisible(NULL)
 }
